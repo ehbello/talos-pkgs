@@ -1,0 +1,97 @@
+name: fork-kernel-build
+
+# Builds ONLY the kernel package, for arm64, on a native arm64 runner, and
+# publishes it under the fork owner's namespace. This repo has dozens of
+# packages; `make` alone would build them all.
+#
+# The resulting image is meant to be consumed by the Talos build via
+#   PKG_KERNEL=ghcr.io/<owner>/kernel:<tag>
+#
+# It triggers on pushes to rockpi4c-* branches, because a workflow that only
+# has workflow_dispatch has to exist on the default branch before it can be
+# dispatched at all.
+
+"on":
+  push:
+    branches:
+      - "rockpi4c-**"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push image to ghcr.io (false = build only)"
+        type: boolean
+        default: true
+      platform:
+        description: "Platform to build for"
+        type: string
+        default: "linux/arm64"
+
+concurrency:
+  group: fork-kernel-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # Fork images under your GitHub user/org (not siderolabs).
+  USERNAME: ${{ github.repository_owner }}
+
+jobs:
+  build:
+    # Native arm64: no QEMU, which is what makes this much faster than
+    # cross-building under emulation.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Unshallow for SOURCE_DATE_EPOCH / git describe
+        run: git fetch --prune --unshallow || true
+
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            platform='${{ inputs.platform }}'
+            push='${{ inputs.push }}'
+          else
+            platform='linux/arm64'
+            push='true'
+          fi
+          echo "platform=${platform}" >> "$GITHUB_OUTPUT"
+          echo "push=${push}" >> "$GITHUB_OUTPUT"
+          echo "Resolved platform=${platform} push=${push}"
+
+      - name: Show what will be built
+        run: |
+          echo "TAG:    $(git describe --tag --always --dirty --match 'v[0-9]*')"
+          echo "kernel: $(grep 'linux_version:' Pkgfile)"
+          echo "patches:"
+          ls kernel/build/patches/*.patch | sed 's|.*/|  |'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GitHub Container Registry
+        if: steps.cfg.outputs.push == 'true'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the kernel package
+        env:
+          PLATFORM: ${{ steps.cfg.outputs.platform }}
+          PUSH: ${{ steps.cfg.outputs.push }}
+        run: make kernel
+
+      - name: Report the resulting image
+        if: steps.cfg.outputs.push == 'true'
+        run: |
+          echo "PKG_KERNEL=${REGISTRY}/${USERNAME}/kernel:$(git describe --tag --always --dirty --match 'v[0-9]*')"
