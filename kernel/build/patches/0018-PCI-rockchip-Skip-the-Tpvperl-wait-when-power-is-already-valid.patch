@@ -25,9 +25,18 @@ Record whether the supplies were already enabled before the driver
 enabled them, and skip the wait in that case. A supply that is already
 on at probe was brought up either by the bootloader or by the regulator
 core at boot, both of which precede a PCIe probe by far more than
-Tpvperl. When the driver really does bring the rails up, or on resume
-where vpcie0v9 has just been re-enabled, the full wait still happens,
-as it does if regulator_is_enabled() cannot tell.
+Tpvperl. When the driver really does bring the rails up the full wait
+still happens, as it does if regulator_is_enabled() cannot tell.
+
+The same check is repeated on resume rather than assuming that power
+was cycled: suspend calls regulator_disable() on the 0.9V supply, which
+only drops a reference, so on a board where that rail is always-on or
+shared with another consumer the power stays valid across the cycle.
+
+Skipping the wait only when every supply is already on is strictly more
+conservative than what this driver did for years: until the change cited
+above there was no Tpvperl wait at all, and PERST# stayed asserted only
+for as long as the register writes in between took.
 
 Measured on a ROCK Pi 4C with a Radxa Penta SATA HAT (JMB585) by
 booting repeatedly and counting how often the endpoint enumerated:
@@ -54,6 +63,18 @@ Fixes: c47f90be4c89 ("PCI: rockchip-host: Fix rockchip_pcie_host_init_port() PER
 Cc: stable@vger.kernel.org
 Signed-off-by: Enrique Hernández Bello <ehbello@gmail.com>
 ---
+---
+v2:
+ - Re-evaluate the supplies in rockchip_pcie_resume_noirq() instead of
+   assuming that the 0.9V rail was really turned off. On a board where
+   that rail is always-on or shared, regulator_disable() leaves it on,
+   and forcing the wait there would reintroduce on resume exactly the
+   failure this patch fixes. Spotted by an automated review of v1.
+ - Factor the test into rockchip_pcie_supplies_enabled() now that it
+   has two callers.
+
+v1: https://lore.kernel.org/all/20260911104952.4190994-1-ehbello@gmail.com/
+
 --- a/drivers/pci/controller/pcie-rockchip.h
 +++ b/drivers/pci/controller/pcie-rockchip.h
 @@ -318,6 +318,7 @@
@@ -77,39 +98,51 @@ Signed-off-by: Enrique Hernández Bello <ehbello@gmail.com>
  	gpiod_set_value_cansleep(rockchip->perst_gpio, 1);
  
  	msleep(PCIE_RESET_CONFIG_WAIT_MS);
-@@ -614,6 +616,23 @@
+@@ -609,11 +611,33 @@
+ 	return 0;
+ }
+ 
++/*
++ * Tpvperl is counted from the supplies becoming valid, and the driver waits
++ * for it with PERST# asserted, so the wait also lengthens the reset pulse.
++ * Supplies that are already enabled before this driver enables them were
++ * brought up by the bootloader or by the regulator core at boot, both of
++ * which precede this point by far more than Tpvperl, so the requirement is
++ * already met. Treat an error from regulator_is_enabled() as "not known to
++ * be on" so that the caller waits.
++ */
++static bool rockchip_pcie_supplies_enabled(struct rockchip_pcie *rockchip)
++{
++	return (IS_ERR(rockchip->vpcie12v) ||
++		regulator_is_enabled(rockchip->vpcie12v) > 0) &&
++	       (IS_ERR(rockchip->vpcie3v3) ||
++		regulator_is_enabled(rockchip->vpcie3v3) > 0) &&
++	       regulator_is_enabled(rockchip->vpcie1v8) > 0 &&
++	       regulator_is_enabled(rockchip->vpcie0v9) > 0;
++}
++
+ static int rockchip_pcie_set_vpcie(struct rockchip_pcie *rockchip)
+ {
  	struct device *dev = rockchip->dev;
  	int err;
  
-+	/*
-+	 * Tpvperl is counted from the supplies becoming valid, and the wait
-+	 * for it happens with PERST# asserted, so it also lengthens the reset.
-+	 * A supply that is already enabled before this driver enables it was
-+	 * brought up either by the bootloader or by the regulator core at boot,
-+	 * both of which precede this probe by far more than Tpvperl, so the
-+	 * requirement is already met and the wait can be skipped. Treat an
-+	 * error from regulator_is_enabled() as "not known to be on" and wait.
-+	 */
 +	rockchip->supplies_pre_enabled =
-+		(IS_ERR(rockchip->vpcie12v) ||
-+		 regulator_is_enabled(rockchip->vpcie12v) > 0) &&
-+		(IS_ERR(rockchip->vpcie3v3) ||
-+		 regulator_is_enabled(rockchip->vpcie3v3) > 0) &&
-+		regulator_is_enabled(rockchip->vpcie1v8) > 0 &&
-+		regulator_is_enabled(rockchip->vpcie0v9) > 0;
++		rockchip_pcie_supplies_enabled(rockchip);
 +
  	if (!IS_ERR(rockchip->vpcie12v)) {
  		err = regulator_enable(rockchip->vpcie12v);
  		if (err) {
-@@ -890,6 +909,9 @@
+@@ -890,6 +914,13 @@
  	struct rockchip_pcie *rockchip = dev_get_drvdata(dev);
  	int err;
  
-+	/* The 0.9V supply was turned off on suspend, so Tpvperl applies. */
-+	rockchip->supplies_pre_enabled = false;
++	/*
++	 * Suspend calls regulator_disable() on the 0.9V supply, but on boards
++	 * where it is always-on or shared the rail does not actually drop, so
++	 * re-evaluate instead of assuming that power was cycled.
++	 */
++	rockchip->supplies_pre_enabled = rockchip_pcie_supplies_enabled(rockchip);
 +
  	err = regulator_enable(rockchip->vpcie0v9);
  	if (err) {
  		dev_err(dev, "fail to enable vpcie0v9 regulator\n");
--- 
-2.43.0
