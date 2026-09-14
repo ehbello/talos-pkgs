@@ -25,6 +25,14 @@ name: fork-kernel-build
         description: "Platform to build for"
         type: string
         default: "linux/arm64"
+      target:
+        description: "pkgs target(s), space-separated. NOTE: kernel and zfs-pkg
+          MUST be built in the same run -- zfs-pkg depends on the kernel-build
+          stage, whose throw-away module-signing key is generated inside that
+          layer. Only a shared (cached) kernel-build stage yields zfs modules
+          the published kernel will accept under module.sig_enforce=1."
+        type: string
+        default: "kernel"
 
 concurrency:
   group: fork-kernel-build-${{ github.workflow }}-${{ github.ref }}
@@ -63,8 +71,11 @@ jobs:
             platform='linux/arm64'
             push='true'
           fi
+          target='${{ inputs.target }}'
+          [ -n "${target}" ] || target='kernel'
           echo "platform=${platform}" >> "$GITHUB_OUTPUT"
           echo "push=${push}" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
           echo "Resolved platform=${platform} push=${push}"
 
       - name: Show what will be built
@@ -89,9 +100,12 @@ jobs:
         env:
           PLATFORM: ${{ steps.cfg.outputs.platform }}
           PUSH: ${{ steps.cfg.outputs.push }}
-        run: make kernel
+        run: make ${{ steps.cfg.outputs.target }}
 
-      - name: Report the resulting image
+      - name: Report the resulting images
         if: steps.cfg.outputs.push == 'true'
         run: |
-          echo "PKG_KERNEL=${REGISTRY}/${USERNAME}/kernel:$(git describe --tag --always --dirty --match 'v[0-9]*')"
+          tag="$(git describe --tag --always --dirty --match 'v[0-9]*')"
+          for t in ${{ steps.cfg.outputs.target }}; do
+            echo "IMAGE=${REGISTRY}/${USERNAME}/${t}:${tag}"
+          done
