@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Enrique Hernández Bello <ehbello@gmail.com>
+Subject: [THROWAWAY] PCI: rockchip: knobs to separate PERST# pulse width from Tpvperl
+
+NOT FOR UPSTREAM. Instrumentation to answer the question raised in review of
+"PCI: rockchip: Skip the Tpvperl wait when power is already valid": does the
+100 ms that commit c47f90be4c89 added matter because it delays the release of
+PERST# (a Tpvperl effect) or because it lengthens the reset pulse the endpoint
+sees?
+
+Two writable module parameters place the same sleep on either side of the
+assertion, and the driver reports the resulting pulse width:
+
+  perst_pre_ms   sleeps before the GPIO is acquired, so before PERST# goes low.
+                 Power has then been valid for even longer, while the pulse
+                 itself stays short.
+  perst_post_ms  sleeps where mainline sleeps, inside the assertion, so it
+                 lengthens the pulse. Defaults to the mainline 100 ms, which
+                 makes the unmodified driver the default behaviour.
+
+Both live under /sys/module/pcie_rockchip_host/parameters/ and take effect on
+the next probe, so a single kernel covers every variant and unbind/bind runs a
+trial without rebooting.
+
+The measured pulse width is only meaningful for probe and bind: the timestamp is
+taken where the GPIO is acquired, and resume does not re-acquire it.
+
+diff --git i/drivers/pci/controller/pcie-rockchip-host.c w/drivers/pci/controller/pcie-rockchip-host.c
+index ee1822c..d3b621d 100644
+--- i/drivers/pci/controller/pcie-rockchip-host.c
++++ w/drivers/pci/controller/pcie-rockchip-host.c
+@@ -28,6 +28,33 @@
+ #include "../pci.h"
+ #include "pcie-rockchip.h"
+ 
++/*
++ * THROWAWAY experiment knobs, NOT for upstream.
++ *
++ * The question being tested is whether the 100 ms that commit c47f90be4c89
++ * added before PERST# is released matters because it delays the release (the
++ * Tpvperl reading) or because it lengthens the reset pulse the endpoint sees.
++ * The two are separated by moving the same sleep outside the assertion:
++ *
++ *   perst_pre_ms   sleeps before the GPIO is acquired, i.e. before PERST# is
++ *                  asserted. The supplies have then been valid for even
++ *                  longer, while the pulse itself stays short.
++ *   perst_post_ms  sleeps where mainline sleeps, inside the assertion, so it
++ *                  lengthens the pulse. Defaults to the mainline value.
++ *
++ * Both are writable at runtime under /sys/module/pcie_rockchip_host/parameters/
++ * and take effect on the next probe, so one kernel covers every variant and
++ * unbind/bind runs a trial without a reboot.
++ */
++static int perst_pre_ms;
++static int perst_post_ms = PCIE_T_PVPERL_MS;
++module_param(perst_pre_ms, int, 0644);
++MODULE_PARM_DESC(perst_pre_ms,
++		 "ms to sleep before PERST# is asserted, outside the reset pulse");
++module_param(perst_post_ms, int, 0644);
++MODULE_PARM_DESC(perst_post_ms,
++		 "ms to sleep inside the PERST# assertion (mainline: 100)");
++
+ static void rockchip_pcie_enable_bw_int(struct rockchip_pcie *rockchip)
+ {
+ 	u32 status;
+@@ -314,9 +341,16 @@ static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip)
+ 	rockchip_pcie_write(rockchip, PCIE_CLIENT_LINK_TRAIN_ENABLE,
+ 			    PCIE_CLIENT_CONFIG);
+ 
+-	msleep(PCIE_T_PVPERL_MS);
++	if (perst_post_ms)
++		msleep(perst_post_ms);
++
+ 	gpiod_set_value_cansleep(rockchip->perst_gpio, 1);
+ 
++	/* THROWAWAY: the width of the pulse the endpoint just saw. */
++	dev_info(rockchip->dev, "PERST# low for %lld ms (pre=%d post=%d)\n",
++		 ktime_ms_delta(ktime_get(), rockchip->perst_asserted_at),
++		 perst_pre_ms, perst_post_ms);
++
+ 	msleep(PCIE_RESET_CONFIG_WAIT_MS);
+ 
+ 	/* 500ms timeout value should be enough for Gen1/2 training */
+@@ -943,6 +977,14 @@ static int rockchip_pcie_probe(struct platform_device *pdev)
+ 	rockchip->dev = dev;
+ 	rockchip->is_rc = true;
+ 
++	/*
++	 * THROWAWAY: wait here, before parse_host_dt() acquires the GPIO and
++	 * thereby asserts PERST#, so that the delay is spent outside the reset
++	 * pulse instead of inside it.
++	 */
++	if (perst_pre_ms)
++		msleep(perst_pre_ms);
++
+ 	err = rockchip_pcie_parse_host_dt(rockchip);
+ 	if (err)
+ 		return err;
+diff --git i/drivers/pci/controller/pcie-rockchip.c w/drivers/pci/controller/pcie-rockchip.c
+index 0f88da3..856151c 100644
+--- i/drivers/pci/controller/pcie-rockchip.c
++++ w/drivers/pci/controller/pcie-rockchip.c
+@@ -97,6 +97,14 @@ int rockchip_pcie_parse_dt(struct rockchip_pcie *rockchip)
+ 		return dev_err_probe(dev, PTR_ERR(rockchip->perst_gpio),
+ 				     "failed to get PERST# GPIO\n");
+ 
++	/*
++	 * THROWAWAY: GPIOD_OUT_LOW above drives the line low, so PERST# is
++	 * asserted here and this is where the reset pulse starts -- not at the
++	 * gpiod_set_value() in rockchip_pcie_host_init_port(), which finds the
++	 * line already low. Stamp it so the pulse width can be measured.
++	 */
++	rockchip->perst_asserted_at = ktime_get();
++
+ 	rockchip->num_clks = devm_clk_bulk_get_all(dev, &rockchip->clks);
+ 	if (rockchip->num_clks < 0)
+ 		return dev_err_probe(dev, rockchip->num_clks,
+diff --git i/drivers/pci/controller/pcie-rockchip.h w/drivers/pci/controller/pcie-rockchip.h
+index 3e82a69..e618563 100644
+--- i/drivers/pci/controller/pcie-rockchip.h
++++ w/drivers/pci/controller/pcie-rockchip.h
+@@ -14,6 +14,7 @@
+ #include <linux/clk.h>
+ #include <linux/hw_bitfield.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
+ #include <linux/pci.h>
+ #include <linux/pci-ecam.h>
+ #include <linux/reset.h>
+@@ -318,6 +319,8 @@ struct rockchip_pcie {
+ 	struct	regulator *vpcie1v8; /* 1.8V power supply */
+ 	struct	regulator *vpcie0v9; /* 0.9V power supply */
+ 	struct	gpio_desc *perst_gpio;
++	/* THROWAWAY: when the PERST# pulse started (probe/bind only). */
++	ktime_t	perst_asserted_at;
+ 	u32	lanes;
+ 	u8      lanes_map;
+ 	int	link_gen;
