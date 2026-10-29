@@ -1,0 +1,136 @@
+From 6696e6051753a9a89a78b0eecf332da7a50dfb43 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrique=20Hern=C3=A1ndez=20Bello?= <ehbello@gmail.com>
+Date: Thu, 29 Oct 2026 11:14:18 +0000
+Subject: [PATCH 2/2] PCI: rockchip-host: Make the PERST# inactive delay
+ configurable
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+rockchip_pcie_host_init_port() waits T_PVPERL, 100 ms, before releasing
+PERST#. The GPIO is acquired with GPIOD_OUT_LOW early in probe, so PERST#
+is already asserted when that wait starts, and the wait therefore sets the
+reset pulse width as well.
+
+That suits a board which powers the slot at the moment it asserts PERST#,
+but endpoints do not agree on what they want. On a ROCK Pi 4C carrying a
+JMB585 SATA controller, a pulse that long stops the endpoint answering
+configuration reads at all. Measured on that board with a single kernel and
+two module parameters, one sleeping before the GPIO is acquired and one in
+place of the wait, timing the pulse with a ktime delta across the two
+gpiod_set_value() calls:
+
+  pre (ms)  post (ms)  pulse      trials  enumerated
+  0         0          1-11 ms    5       5
+  0         10         ~18 ms     3       3
+  0         15         24-47 ms   4       4
+  0         20         ~28 ms     3       1
+  0         100        ~108 ms    4       0
+  200       0          6-11 ms    5       5
+  200       100        ~108 ms    1       0
+
+Delaying the assertion changes nothing, while widening the pulse decides
+everything. The slot supply on this board is regulator-always-on, so power
+had been valid for seconds in every row above, the failing ones included.
+
+Rather than change the delay for every board, read it from the device tree,
+reusing the property names the Rockchip vendor driver already carries for
+the dwc-based controllers in pcie-dw-rockchip.c. The default is unchanged,
+so a board that describes nothing behaves exactly as before. Whatever the
+board asks for, PERST# stays asserted for at least the 100 us minimum the
+specification sets, which covers T_PERST and T_PERST-CLK.
+
+Suggested-by: Shawn Lin <shawn.lin@rock-chips.com>
+Link: https://lore.kernel.org/all/95aeecc0-2794-4cc6-a635-5c042afc1405@rock-chips.com/
+Signed-off-by: Enrique Hernández Bello <ehbello@gmail.com>
+---
+ drivers/pci/controller/pcie-rockchip-host.c | 26 +++++++++++++++++----
+ drivers/pci/controller/pcie-rockchip.h      |  2 ++
+ 2 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-rockchip-host.c b/drivers/pci/controller/pcie-rockchip-host.c
+index ee1822c..6fbdae0 100644
+--- a/drivers/pci/controller/pcie-rockchip-host.c
++++ b/drivers/pci/controller/pcie-rockchip-host.c
+@@ -24,6 +24,7 @@
+ #include <linux/of_pci.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ 
+ #include "../pci.h"
+ #include "pcie-rockchip.h"
+@@ -279,8 +280,10 @@ static void rockchip_pcie_set_power_limit(struct rockchip_pcie *rockchip)
+ /**
+  * rockchip_pcie_host_init_port - Initialize hardware
+  * @rockchip: PCIe port information
++ * @perst_inactive_ms: how long to hold PERST# asserted before releasing it
+  */
+-static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip)
++static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip,
++					u32 perst_inactive_ms)
+ {
+ 	struct device *dev = rockchip->dev;
+ 	int err, i = MAX_LANE_NUM;
+@@ -314,7 +317,12 @@ static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip)
+ 	rockchip_pcie_write(rockchip, PCIE_CLIENT_LINK_TRAIN_ENABLE,
+ 			    PCIE_CLIENT_CONFIG);
+ 
+-	msleep(PCIE_T_PVPERL_MS);
++	/*
++	 * PERST# has been asserted since the GPIO was acquired, so this wait
++	 * is also the reset pulse width. Never go below the specification
++	 * minimum, which covers both T_PERST and T_PERST-CLK, each 100 us.
++	 */
++	fsleep(max(perst_inactive_ms * USEC_PER_MSEC, PCIE_T_PERST_CLK_US));
+ 	gpiod_set_value_cansleep(rockchip->perst_gpio, 1);
+ 
+ 	msleep(PCIE_RESET_CONFIG_WAIT_MS);
+@@ -606,6 +614,14 @@ static int rockchip_pcie_parse_host_dt(struct rockchip_pcie *rockchip)
+ 	if (IS_ERR(rockchip->vpcie0v9))
+ 		return PTR_ERR(rockchip->vpcie0v9);
+ 
++	if (device_property_read_u32(dev, "rockchip,perst-inactive-ms",
++				     &rockchip->perst_inactive_ms))
++		rockchip->perst_inactive_ms = PCIE_T_PVPERL_MS;
++
++	if (device_property_read_u32(dev, "rockchip,s2r-perst-inactive-ms",
++				     &rockchip->s2r_perst_inactive_ms))
++		rockchip->s2r_perst_inactive_ms = rockchip->perst_inactive_ms;
++
+ 	return 0;
+ }
+ 
+@@ -900,7 +916,8 @@ static int rockchip_pcie_resume_noirq(struct device *dev)
+ 	if (err)
+ 		goto err_disable_0v9;
+ 
+-	err = rockchip_pcie_host_init_port(rockchip);
++	err = rockchip_pcie_host_init_port(rockchip,
++					   rockchip->s2r_perst_inactive_ms);
+ 	if (err)
+ 		goto err_pcie_resume;
+ 
+@@ -957,7 +974,8 @@ static int rockchip_pcie_probe(struct platform_device *pdev)
+ 		goto err_set_vpcie;
+ 	}
+ 
+-	err = rockchip_pcie_host_init_port(rockchip);
++	err = rockchip_pcie_host_init_port(rockchip,
++					   rockchip->perst_inactive_ms);
+ 	if (err)
+ 		goto err_vpcie;
+ 
+diff --git a/drivers/pci/controller/pcie-rockchip.h b/drivers/pci/controller/pcie-rockchip.h
+index 3e82a69..08e9d13 100644
+--- a/drivers/pci/controller/pcie-rockchip.h
++++ b/drivers/pci/controller/pcie-rockchip.h
+@@ -318,6 +318,8 @@ struct rockchip_pcie {
+ 	struct	regulator *vpcie1v8; /* 1.8V power supply */
+ 	struct	regulator *vpcie0v9; /* 0.9V power supply */
+ 	struct	gpio_desc *perst_gpio;
++	u32	perst_inactive_ms;
++	u32	s2r_perst_inactive_ms;
+ 	u32	lanes;
+ 	u8      lanes_map;
+ 	int	link_gen;

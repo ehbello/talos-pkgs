@@ -1,0 +1,55 @@
+From bbc6705ee59335cafb0fe7f811a4c23c62cf283d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrique=20Hern=C3=A1ndez=20Bello?= <ehbello@gmail.com>
+Date: Thu, 29 Oct 2026 11:14:18 +0000
+Subject: [PATCH 1/2] dt-bindings: PCI: rockchip,rk3399-pcie: Add PERST#
+ inactive delay properties
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The driver holds PERST# asserted for T_PVPERL (100 ms) before releasing it.
+Endpoints disagree about what they want there: some need longer than the
+default to settle, while others stop answering configuration reads when the
+reset pulse is stretched that far, because PERST# stays asserted for the
+whole wait.
+
+Describe two properties so a board can state what its endpoint needs, named
+after the ones the Rockchip vendor driver already uses for the dwc-based
+controllers:
+
+  rockchip,perst-inactive-ms      - the delay used at probe
+  rockchip,s2r-perst-inactive-ms  - the delay used when resuming
+
+Both are optional and the defaults preserve the current behaviour.
+
+Signed-off-by: Enrique Hernández Bello <ehbello@gmail.com>
+---
+ .../bindings/pci/rockchip,rk3399-pcie.yaml        | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/pci/rockchip,rk3399-pcie.yaml b/Documentation/devicetree/bindings/pci/rockchip,rk3399-pcie.yaml
+index 720a5f9..7ac915c 100644
+--- a/Documentation/devicetree/bindings/pci/rockchip,rk3399-pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/rockchip,rk3399-pcie.yaml
+@@ -40,6 +40,21 @@ properties:
+     maxItems: 1
+     description: pre-reset GPIO
+ 
++  rockchip,perst-inactive-ms:
++    default: 100
++    description:
++      Time PERST# is held asserted before it is released, which is also the
++      width of the reset pulse. The default meets T_PVPERL for a slot that
++      is powered at the moment PERST# is asserted. Some endpoints need more
++      settling time than that, while others stop responding when the pulse
++      is that long. A value of 0 selects the 100 us minimum the PCI Express
++      CEM specification sets for the pulse.
++
++  rockchip,s2r-perst-inactive-ms:
++    description:
++      The same time, applied when resuming from system suspend. Defaults to
++      the value of rockchip,perst-inactive-ms.
++
+   vpcie12v-supply:
+     description: The 12v regulator to use for PCIe.
+ 
